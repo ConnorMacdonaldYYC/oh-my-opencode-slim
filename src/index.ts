@@ -5,6 +5,7 @@ import { loadPluginConfig, type MultiplexerConfig } from './config';
 import { parseList } from './config/agent-mcps';
 import { CouncilManager } from './council';
 import {
+  createApplyPatchHook,
   createAutoUpdateCheckerHook,
   createChatHeadersHook,
   createDelegateTaskRetryHook,
@@ -15,6 +16,7 @@ import {
   createTodoContinuationHook,
   ForegroundFallbackManager,
 } from './hooks';
+import { createInterviewManager } from './interview';
 import { createBuiltinMcps } from './mcp';
 import { getMultiplexer, startAvailabilityCheck } from './multiplexer';
 import {
@@ -146,14 +148,21 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
     config,
   );
 
+  // Track session → agent mapping for serve-mode system prompt injection
+  const sessionAgentMap = new Map<string, string>();
+
   // Initialize post-file-tool nudge hook
-  const postFileToolNudgeHook = createPostFileToolNudgeHook();
+  const postFileToolNudgeHook = createPostFileToolNudgeHook({
+    shouldInject: (sessionID) =>
+      sessionAgentMap.get(sessionID) === 'orchestrator',
+  });
 
   const chatHeadersHook = createChatHeadersHook(ctx);
 
   // Initialize delegate-task retry guidance hook
   const delegateTaskRetryHook = createDelegateTaskRetryHook(ctx);
 
+  const applyPatchHook = createApplyPatchHook(ctx);
   // Initialize JSON parse error recovery hook
   const jsonErrorRecoveryHook = createJsonErrorRecoveryHook(ctx);
 
@@ -164,9 +173,6 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
     config.fallback?.enabled !== false && Object.keys(runtimeChains).length > 0,
   );
 
-  // Track session → agent mapping for serve-mode system prompt injection
-  const sessionAgentMap = new Map<string, string>();
-
   // Initialize todo-continuation hook (opt-in auto-continue for incomplete todos)
   const todoContinuationHook = createTodoContinuationHook(ctx, {
     maxContinuations: config.todoContinuation?.maxContinuations ?? 5,
@@ -174,6 +180,7 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
     autoEnable: config.todoContinuation?.autoEnable ?? false,
     autoEnableThreshold: config.todoContinuation?.autoEnableThreshold ?? 4,
   });
+  const interviewManager = createInterviewManager(ctx, config);
 
   return {
     name: 'oh-my-opencode-slim',
@@ -384,6 +391,8 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
             'Enable auto-continuation — orchestrator keeps working through incomplete todos',
         };
       }
+
+      interviewManager.registerCommand(opencodeConfig);
     },
 
     event: async (input) => {
@@ -437,6 +446,45 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
           properties?: { sessionID?: string };
         },
       );
+
+      await interviewManager.handleEvent(
+        input as {
+          event: { type: string; properties?: Record<string, unknown> };
+        },
+      );
+
+      await postFileToolNudgeHook.event(
+        input as {
+          event: {
+            type: string;
+            properties?: {
+              info?: { id?: string };
+              sessionID?: string;
+            };
+          };
+        },
+      );
+
+      if (input.event.type === 'session.deleted') {
+        const props = input.event.properties as
+          | { info?: { id?: string }; sessionID?: string }
+          | undefined;
+        const sessionID = props?.info?.id ?? props?.sessionID;
+        if (sessionID) {
+          sessionAgentMap.delete(sessionID);
+        }
+      }
+    },
+
+    // Best-effort rescue only for stale apply_patch input before native execution
+    'tool.execute.before': async (input, output) => {
+      await applyPatchHook['tool.execute.before'](
+        input as {
+          tool: string;
+          directory?: string;
+        },
+        output as { args?: { patchText?: unknown; [key: string]: unknown } },
+      );
     },
 
     // Direct interception of /auto-continue command — bypasses LLM round-trip
@@ -449,18 +497,32 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
         },
         output as { parts: Array<{ type: string; text?: string }> },
       );
+
+      await interviewManager.handleCommandExecuteBefore(
+        input as {
+          command: string;
+          sessionID: string;
+          arguments: string;
+        },
+        output as { parts: Array<{ type: string; text?: string }> },
+      );
     },
 
     'chat.headers': chatHeadersHook['chat.headers'],
 
     // Track which agent each session uses (needed for serve-mode prompt injection)
-    'chat.message': async (input: {
-      sessionID: string;
-      agent?: string;
-    }) => {
-      if (input.agent) {
-        sessionAgentMap.set(input.sessionID, input.agent);
+    'chat.message': async (
+      input: { sessionID: string; agent?: string },
+      output?: { message?: { agent?: string } },
+    ) => {
+      const agent = input.agent ?? output?.message?.agent;
+      if (agent) {
+        sessionAgentMap.set(input.sessionID, agent);
       }
+      todoContinuationHook.handleChatMessage({
+        sessionID: input.sessionID,
+        agent,
+      });
     },
 
     // Inject orchestrator system prompt for serve-mode sessions.
@@ -483,9 +545,17 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
         if (!alreadyInjected) {
           // Prepend the orchestrator prompt to the system array
           const { ORCHESTRATOR_PROMPT } = await import('./agents/orchestrator');
-          output.system[0] = ORCHESTRATOR_PROMPT + (output.system[0] ? '\n\n' + output.system[0] : '');
+          output.system[0] =
+            ORCHESTRATOR_PROMPT +
+            (output.system[0] ? `\n\n${output.system[0]}` : '');
         }
       }
+
+      await todoContinuationHook.handleChatSystemTransform(input, output);
+      await postFileToolNudgeHook['experimental.chat.system.transform'](
+        input,
+        output,
+      );
     },
 
     // Inject phase reminder and filter available skills before sending to API (doesn't show in UI)
@@ -504,6 +574,9 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
           }>;
         }>;
       };
+      await todoContinuationHook.handleMessagesTransform({
+        messages: typedOutput.messages,
+      });
       await phaseReminderHook['experimental.chat.messages.transform'](
         input,
         typedOutput,
@@ -531,6 +604,13 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
           title: string;
           output: unknown;
           metadata: unknown;
+        },
+      );
+
+      await todoContinuationHook.handleToolExecuteAfter(
+        input as {
+          tool: string;
+          sessionID?: string;
         },
       );
 

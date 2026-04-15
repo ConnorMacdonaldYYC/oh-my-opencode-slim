@@ -1,6 +1,10 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { SLIM_INTERNAL_INITIATOR_MARKER } from '../../utils';
 import { createTodoContinuationHook } from './index';
+import {
+  TODO_FINAL_ACTIVE_REMINDER,
+  TODO_HYGIENE_REMINDER,
+} from './todo-hygiene';
 
 describe('createTodoContinuationHook', () => {
   function createMockContext(overrides?: {
@@ -52,11 +56,32 @@ describe('createTodoContinuationHook', () => {
     ).length;
   }
   function contCall(m: ReturnType<typeof mock>): any[] {
-    return m.mock.calls.find((c: any[]) =>
+    const call = m.mock.calls.find((c: any[]) =>
       (c[0]?.body?.parts as any[])?.some((p: any) =>
         p.text?.includes(SLIM_INTERNAL_INITIATOR_MARKER),
       ),
-    )!;
+    );
+    if (!call) {
+      throw new Error('No continuation call found');
+    }
+    return call;
+  }
+
+  function userMessages(
+    text: string,
+    sessionID = 'main1',
+    agent?: string,
+    parts?: Array<{ type: string; text?: string }>,
+    id?: string,
+  ) {
+    return {
+      messages: [
+        {
+          info: { id, role: 'user', agent, sessionID },
+          parts: parts ?? [{ type: 'text', text }],
+        },
+      ],
+    };
   }
 
   describe('tool toggle', () => {
@@ -77,6 +102,477 @@ describe('createTodoContinuationHook', () => {
       const result = await hook.tool.auto_continue.execute({ enabled: false });
 
       expect(result).toBe('Auto-continue disabled.');
+    });
+  });
+
+  describe('todo hygiene routing', () => {
+    test('does not inject hygiene reminder for unknown non-orchestrator session', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            { id: '1', content: 'todo1', status: 'pending', priority: 'high' },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages('continue previous work', 'sub1', 'explorer'),
+      );
+      await hook.handleToolExecuteAfter({ tool: 'task', sessionID: 'sub1' });
+      await hook.handleChatSystemTransform({ sessionID: 'sub1' }, system);
+
+      expect(system.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
+    });
+
+    test('does not inject anything at request start before todowrite', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            {
+              id: '1',
+              content: 'todo1',
+              status: 'in_progress',
+              priority: 'high',
+            },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages(
+          'continue with the unfinished work',
+          'main1',
+          'orchestrator',
+        ),
+      );
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, system);
+
+      expect(system.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
+      expect(system.system.join('\n')).not.toContain(
+        TODO_FINAL_ACTIVE_REMINDER,
+      );
+    });
+
+    test('new requests clear stale pending reminder state', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            { id: '1', content: 'todo1', status: 'pending', priority: 'high' },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const blocked = { system: ['base'] };
+      const allowed = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages('primera request', 'main1', 'orchestrator'),
+      );
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleMessagesTransform(
+        userMessages('segunda request distinta', 'main1', 'orchestrator'),
+      );
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, blocked);
+
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, allowed);
+
+      expect(blocked.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
+      expect(allowed.system.join('\n')).toContain(TODO_HYGIENE_REMINDER);
+    });
+
+    test('attachment-only requests still reset stale pending reminder state', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            { id: '1', content: 'todo1', status: 'pending', priority: 'high' },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const blocked = { system: ['base'] };
+      const allowed = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages('primera request', 'main1', 'orchestrator'),
+      );
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleMessagesTransform(
+        userMessages('', 'main1', 'orchestrator', [{ type: 'image' }]),
+      );
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, blocked);
+
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, allowed);
+
+      expect(blocked.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
+      expect(allowed.system.join('\n')).toContain(TODO_HYGIENE_REMINDER);
+    });
+
+    test('falls back to known orchestrator session when transform message lacks sessionID', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            {
+              id: '1',
+              content: 'todo1',
+              status: 'in_progress',
+              priority: 'high',
+            },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+      await hook.handleMessagesTransform({
+        messages: [
+          {
+            info: { role: 'user', agent: 'orchestrator' },
+            parts: [{ type: 'text', text: 'new request boundary' }],
+          },
+        ],
+      });
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, system);
+
+      expect(system.system.join('\n')).toContain(TODO_FINAL_ACTIVE_REMINDER);
+    });
+
+    test('does not promote sessions with missing agent metadata to orchestrator', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            { id: '1', content: 'todo1', status: 'pending', priority: 'high' },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages('continue previous work', 'sub1'),
+      );
+      await hook.handleToolExecuteAfter({ tool: 'task', sessionID: 'sub1' });
+      await hook.handleChatSystemTransform({ sessionID: 'sub1' }, system);
+
+      expect(system.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
+      expect(system.system.join('\n')).not.toContain(
+        TODO_FINAL_ACTIVE_REMINDER,
+      );
+    });
+
+    test('known orchestrator sessions still process request boundaries when agent metadata is missing', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            {
+              id: '1',
+              content: 'todo1',
+              status: 'in_progress',
+              priority: 'high',
+            },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+      await hook.handleMessagesTransform(
+        userMessages('new request boundary', 'main1'),
+      );
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, system);
+
+      expect(system.system.join('\n')).toContain(TODO_FINAL_ACTIVE_REMINDER);
+    });
+
+    test('the same user message id does not reset the request when its array index shifts', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            { id: '1', content: 'todo1', status: 'pending', priority: 'high' },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages(
+          'request boundary',
+          'main1',
+          'orchestrator',
+          undefined,
+          'u1',
+        ),
+      );
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleMessagesTransform({
+        messages: [
+          {
+            info: { role: 'assistant', sessionID: 'main1' },
+            parts: [{ type: 'text', text: 'intermediate output' }],
+          },
+          {
+            info: {
+              id: 'u1',
+              role: 'user',
+              agent: 'orchestrator',
+              sessionID: 'main1',
+            },
+            parts: [{ type: 'text', text: 'request boundary' }],
+          },
+        ],
+      });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, system);
+
+      expect(system.system.join('\n')).toContain(TODO_HYGIENE_REMINDER);
+    });
+
+    test('a new user message id resets the request even if the text is unchanged', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            { id: '1', content: 'todo1', status: 'pending', priority: 'high' },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const blocked = { system: ['base'] };
+      const allowed = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages('same text', 'main1', 'orchestrator', undefined, 'u1'),
+      );
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleMessagesTransform(
+        userMessages('same text', 'main1', 'orchestrator', undefined, 'u2'),
+      );
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, blocked);
+
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, allowed);
+
+      expect(blocked.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
+      expect(allowed.system.join('\n')).toContain(TODO_HYGIENE_REMINDER);
+    });
+
+    test('a repeated text without message ids still resets when a later user turn appears', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            { id: '1', content: 'todo1', status: 'pending', priority: 'high' },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const blocked = { system: ['base'] };
+      const allowed = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages('same text', 'main1', 'orchestrator'),
+      );
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleMessagesTransform({
+        messages: [
+          {
+            info: { role: 'user', agent: 'orchestrator', sessionID: 'main1' },
+            parts: [{ type: 'text', text: 'same text' }],
+          },
+          {
+            info: { role: 'assistant', sessionID: 'main1' },
+            parts: [{ type: 'text', text: 'intermediate output' }],
+          },
+          {
+            info: { role: 'user', agent: 'orchestrator', sessionID: 'main1' },
+            parts: [{ type: 'text', text: 'same text' }],
+          },
+        ],
+      });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, blocked);
+
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, allowed);
+
+      expect(blocked.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
+      expect(allowed.system.join('\n')).toContain(TODO_HYGIENE_REMINDER);
+    });
+
+    test('messages without inferable sessionID clear stale state for known orchestrators', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            { id: '1', content: 'todo1', status: 'pending', priority: 'high' },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+      hook.handleChatMessage({ sessionID: 'main2', agent: 'orchestrator' });
+      await hook.handleMessagesTransform(
+        userMessages('first request', 'main1', 'orchestrator', undefined, 'u1'),
+      );
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleMessagesTransform({
+        messages: [
+          {
+            info: { role: 'user', agent: 'orchestrator' },
+            parts: [{ type: 'text', text: 'boundary without session id' }],
+          },
+        ],
+      });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, system);
+
+      expect(system.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
+      expect(system.system.join('\n')).not.toContain(
+        TODO_FINAL_ACTIVE_REMINDER,
+      );
+    });
+
+    test('does not inject from continuation-like wording alone', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            {
+              id: '1',
+              content: 'todo1',
+              status: 'in_progress',
+              priority: 'high',
+            },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages(
+          'sigue este formato pero empieza de cero',
+          'main1',
+          'orchestrator',
+        ),
+      );
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, system);
+
+      expect(system.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
+      expect(system.system.join('\n')).not.toContain(
+        TODO_FINAL_ACTIVE_REMINDER,
+      );
+    });
+
+    test('rearms on activity after todowrite even if request wording is continuation-like', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            {
+              id: '1',
+              content: 'todo1',
+              status: 'in_progress',
+              priority: 'high',
+            },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages('finish the previous work', 'main1', 'orchestrator'),
+      );
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleToolExecuteAfter({ tool: 'read', sessionID: 'main1' });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, system);
+
+      expect(system.system.join('\n')).toContain(TODO_FINAL_ACTIVE_REMINDER);
+    });
+
+    test('final active todo after todowrite uses the stronger finishing reminder', async () => {
+      const ctx = createMockContext({
+        todoResult: {
+          data: [
+            {
+              id: '1',
+              content: 'todo1',
+              status: 'in_progress',
+              priority: 'high',
+            },
+          ],
+        },
+      });
+      const hook = createTodoContinuationHook(ctx);
+      const system = { system: ['base'] };
+
+      await hook.handleMessagesTransform(
+        userMessages('haz esto', 'main1', 'orchestrator'),
+      );
+      await hook.handleToolExecuteAfter({
+        tool: 'todowrite',
+        sessionID: 'main1',
+      });
+      await hook.handleChatSystemTransform({ sessionID: 'main1' }, system);
+
+      expect(system.system.join('\n')).toContain(TODO_FINAL_ACTIVE_REMINDER);
+      expect(system.system.join('\n')).not.toContain(TODO_HYGIENE_REMINDER);
     });
   });
 
@@ -393,7 +889,7 @@ describe('createTodoContinuationHook', () => {
       });
       const hook = createTodoContinuationHook(ctx, {
         maxContinuations: 5,
-        cooldownMs: 100,
+        cooldownMs: 500,
       });
 
       await hook.tool.auto_continue.execute({ enabled: true });
@@ -406,8 +902,8 @@ describe('createTodoContinuationHook', () => {
         },
       });
 
-      // Before cooldown expires, fire session.status with busy
-      await delay(50);
+      // After the notification grace but before cooldown expires, fire busy.
+      await delay(300);
       await hook.handleEvent({
         event: {
           type: 'session.status',
@@ -419,7 +915,7 @@ describe('createTodoContinuationHook', () => {
       });
 
       // Advance past original cooldown
-      await delay(60);
+      await delay(250);
 
       // Verify timer was cancelled and prompt NOT called
       expect(hasContinuation(ctx.client.session.prompt)).toBe(false);
@@ -469,7 +965,7 @@ describe('createTodoContinuationHook', () => {
       });
 
       // Advance past original cooldown
-      await delay(60);
+      await delay(250);
 
       // Orchestrator timer should still fire — prompt was called
       expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
@@ -564,7 +1060,7 @@ describe('createTodoContinuationHook', () => {
     });
 
     test('cooldownMs from config', async () => {
-      const customCooldownMs = 100;
+      const customCooldownMs = 150;
       const ctx = createMockContext({
         todoResult: {
           data: [
@@ -594,14 +1090,14 @@ describe('createTodoContinuationHook', () => {
         },
       });
 
-      // Advance timer by less than custom cooldown
-      await delay(customCooldownMs - 1);
+      // Advance timer by well under the custom cooldown to avoid timer jitter
+      await delay(60);
 
       // Verify prompt not called yet
       expect(hasContinuation(ctx.client.session.prompt)).toBe(false);
 
-      // Advance timer by remaining 1ms
-      await delay(1);
+      // Advance timer past the configured cooldown
+      await delay(100);
 
       // Now prompt should be called
       expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
@@ -802,7 +1298,7 @@ describe('createTodoContinuationHook', () => {
       });
 
       // Advance past original cooldown
-      await delay(60);
+      await delay(250);
 
       // Verify timer was cancelled and prompt NOT called
       expect(hasContinuation(ctx.client.session.prompt)).toBe(false);
@@ -851,7 +1347,7 @@ describe('createTodoContinuationHook', () => {
       });
 
       // Advance past original cooldown
-      await delay(60);
+      await delay(250);
 
       // Orchestrator timer should still fire — prompt was called
       expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
@@ -1890,6 +2386,278 @@ describe('createTodoContinuationHook', () => {
         );
         expect(output2.parts[0].text).toContain('disabled');
       });
+    });
+  });
+
+  describe('session routing and notification cancellation', () => {
+    function createPendingCtx() {
+      return createMockContext({
+        todoResult: {
+          data: [
+            { id: '1', content: 'todo1', status: 'pending', priority: 'high' },
+          ],
+        },
+        messagesResult: {
+          data: [
+            {
+              info: { role: 'assistant' },
+              parts: [{ type: 'text', text: 'Work in progress' }],
+            },
+          ],
+        },
+      });
+    }
+
+    test('chat.message registers orchestrator sessions without first-idle lockout', async () => {
+      const ctx = createPendingCtx();
+      const hook = createTodoContinuationHook(ctx, {
+        cooldownMs: 50,
+      });
+      await hook.tool.auto_continue.execute({ enabled: true });
+
+      hook.handleChatMessage({ sessionID: 'sub1', agent: 'fixer' });
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+      hook.handleChatMessage({ sessionID: 'main2', agent: 'orchestrator' });
+
+      await hook.handleEvent({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'sub1' },
+        },
+      });
+      await delay(60);
+      expect(hasContinuation(ctx.client.session.prompt)).toBe(false);
+
+      await hook.handleEvent({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'main2' },
+        },
+      });
+      await delay(60);
+
+      expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
+      expect(contCall(ctx.client.session.prompt)[0].path.id).toBe('main2');
+    });
+
+    test('chat.message without agent does not block legacy first-idle fallback', async () => {
+      const ctx = createPendingCtx();
+      const hook = createTodoContinuationHook(ctx, {
+        cooldownMs: 50,
+        autoEnable: true,
+        autoEnableThreshold: 1,
+      });
+
+      hook.handleChatMessage({ sessionID: 'main1' });
+      await hook.handleEvent({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'main1' },
+        },
+      });
+      await delay(60);
+
+      expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
+    });
+
+    test('subagent chat.message prevents first-idle fallback registration', async () => {
+      const ctx = createPendingCtx();
+      const hook = createTodoContinuationHook(ctx, {
+        cooldownMs: 50,
+        autoEnable: true,
+        autoEnableThreshold: 1,
+      });
+
+      hook.handleChatMessage({ sessionID: 'sub1', agent: 'fixer' });
+      await hook.handleEvent({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'sub1' },
+        },
+      });
+      await delay(60);
+
+      expect(ctx.client.session.prompt).not.toHaveBeenCalled();
+    });
+
+    test('session.status idle triggers continuation like session.idle', async () => {
+      const ctx = createPendingCtx();
+      const hook = createTodoContinuationHook(ctx, { cooldownMs: 50 });
+      await hook.tool.auto_continue.execute({ enabled: true });
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+
+      await hook.handleEvent({
+        event: {
+          type: 'session.status',
+          properties: { sessionID: 'main1', status: { type: 'idle' } },
+        },
+      });
+      await delay(60);
+
+      expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
+    });
+
+    test('deleting another orchestrator does not cancel the active session timer', async () => {
+      const ctx = createPendingCtx();
+      const hook = createTodoContinuationHook(ctx, { cooldownMs: 50 });
+      await hook.tool.auto_continue.execute({ enabled: true });
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+      hook.handleChatMessage({ sessionID: 'main2', agent: 'orchestrator' });
+
+      await hook.handleEvent({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'main1' },
+        },
+      });
+      await hook.handleEvent({
+        event: {
+          type: 'session.deleted',
+          properties: { sessionID: 'main2' },
+        },
+      });
+      await delay(60);
+
+      expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
+      expect(contCall(ctx.client.session.prompt)[0].path.id).toBe('main1');
+    });
+
+    test('deleting all orchestrators restores legacy first-idle fallback', async () => {
+      const ctx = createPendingCtx();
+      const hook = createTodoContinuationHook(ctx, {
+        cooldownMs: 50,
+        autoEnable: true,
+        autoEnableThreshold: 1,
+      });
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+      hook.handleChatMessage({ sessionID: 'main2', agent: 'orchestrator' });
+
+      await hook.handleEvent({
+        event: {
+          type: 'session.deleted',
+          properties: { sessionID: 'main1' },
+        },
+      });
+      await hook.handleEvent({
+        event: {
+          type: 'session.deleted',
+          properties: { sessionID: 'main2' },
+        },
+      });
+
+      await hook.handleEvent({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'legacy-main' },
+        },
+      });
+      await delay(60);
+
+      expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
+      expect(contCall(ctx.client.session.prompt)[0].path.id).toBe(
+        'legacy-main',
+      );
+    });
+
+    test('countdown notification busy status does not reset max-continuation counter', async () => {
+      const ctx = createPendingCtx();
+      const releaseNotifications: Array<() => void> = [];
+      ctx.client.session.prompt = mock(async (args: any) => {
+        if (args?.body?.noReply === true) {
+          await new Promise<void>((resolve) => {
+            releaseNotifications.push(resolve);
+          });
+        }
+        return {};
+      });
+      const hook = createTodoContinuationHook(ctx, {
+        cooldownMs: 50,
+        maxContinuations: 2,
+      });
+      await hook.tool.auto_continue.execute({ enabled: true });
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+
+      for (let i = 0; i < 2; i++) {
+        await hook.handleEvent({
+          event: {
+            type: 'session.idle',
+            properties: { sessionID: 'main1' },
+          },
+        });
+        await hook.handleEvent({
+          event: {
+            type: 'session.status',
+            properties: { sessionID: 'main1', status: { type: 'busy' } },
+          },
+        });
+        await delay(60);
+        releaseNotifications.shift()?.();
+        await delay(10);
+      }
+
+      ctx.client.session.prompt.mockClear();
+      await hook.handleEvent({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'main1' },
+        },
+      });
+      await delay(60);
+
+      expect(ctx.client.session.prompt).not.toHaveBeenCalled();
+    });
+
+    test('late countdown notification busy status does not cancel continuation timer', async () => {
+      const ctx = createPendingCtx();
+      const hook = createTodoContinuationHook(ctx, { cooldownMs: 50 });
+      await hook.tool.auto_continue.execute({ enabled: true });
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+
+      await hook.handleEvent({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'main1' },
+        },
+      });
+      await delay(10);
+      await hook.handleEvent({
+        event: {
+          type: 'session.status',
+          properties: { sessionID: 'main1', status: { type: 'busy' } },
+        },
+      });
+      await delay(60);
+
+      expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
+    });
+
+    test('countdown notification busy status does not cancel continuation timer', async () => {
+      const ctx = createPendingCtx();
+      let callCount = 0;
+      ctx.client.session.prompt = mock(async () => {
+        callCount++;
+        return {};
+      });
+      const hook = createTodoContinuationHook(ctx, { cooldownMs: 50 });
+      await hook.tool.auto_continue.execute({ enabled: true });
+      hook.handleChatMessage({ sessionID: 'main1', agent: 'orchestrator' });
+
+      await hook.handleEvent({
+        event: {
+          type: 'session.idle',
+          properties: { sessionID: 'main1' },
+        },
+      });
+      await hook.handleEvent({
+        event: {
+          type: 'session.status',
+          properties: { sessionID: 'main1', status: { type: 'busy' } },
+        },
+      });
+      await delay(60);
+
+      expect(callCount).toBeGreaterThanOrEqual(2);
+      expect(hasContinuation(ctx.client.session.prompt)).toBe(true);
     });
   });
 

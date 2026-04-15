@@ -317,6 +317,33 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "blaszewski",
+      "name": "Bartosz Łaszewski",
+      "avatar_url": "https://avatars.githubusercontent.com/u/14119531?v=4",
+      "profile": "https://github.com/blaszewski",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "huilang021x",
+      "name": "huilang021x",
+      "avatar_url": "https://avatars.githubusercontent.com/u/77293911?v=4",
+      "profile": "https://github.com/huilang021x",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "dkovacevic15",
+      "name": "Dusan Kovacevic",
+      "avatar_url": "https://avatars.githubusercontent.com/u/24757821?v=4",
+      "profile": "https://github.com/dkovacevic15",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"

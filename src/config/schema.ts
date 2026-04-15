@@ -100,6 +100,7 @@ export const AgentOverrideConfigSchema = z.object({
   variant: z.string().optional().catch(undefined),
   skills: z.array(z.string()).optional(), // skills this agent can use ("*" = all, "!item" = exclude)
   mcps: z.array(z.string()).optional(), // MCPs this agent can use ("*" = all, "!item" = exclude)
+  options: z.record(z.string(), z.unknown()).optional(), // provider-specific model options (e.g., textVerbosity, thinking budget)
 });
 
 // Multiplexer type options
@@ -165,6 +166,15 @@ export const BackgroundTaskConfigSchema = z.object({
 });
 
 export type BackgroundTaskConfig = z.infer<typeof BackgroundTaskConfigSchema>;
+
+export const InterviewConfigSchema = z.object({
+  maxQuestions: z.number().int().min(1).max(10).default(2),
+  outputFolder: z.string().min(1).default('interview'),
+  autoOpenBrowser: z.boolean().default(true),
+  port: z.number().int().min(0).max(65535).default(0),
+});
+
+export type InterviewConfig = z.infer<typeof InterviewConfigSchema>;
 
 // Todo continuation configuration
 export const TodoContinuationConfigSchema = z.object({
@@ -238,6 +248,7 @@ export const PluginConfigSchema = z.object({
   tmux: TmuxConfigSchema.optional(),
   websearch: WebsearchConfigSchema.optional(),
   background: BackgroundTaskConfigSchema.optional(),
+  interview: InterviewConfigSchema.optional(),
   todoContinuation: TodoContinuationConfigSchema.optional(),
   fallback: FailoverConfigSchema.optional(),
   council: CouncilConfigSchema.optional(),
