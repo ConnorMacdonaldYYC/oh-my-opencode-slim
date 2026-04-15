@@ -3,6 +3,7 @@ import { CouncilConfigSchema } from './council-schema';
 
 const FALLBACK_AGENT_NAMES = [
   'orchestrator',
+  'planner',
   'oracle',
   'designer',
   'explorer',
@@ -12,6 +13,7 @@ const FALLBACK_AGENT_NAMES = [
 
 const MANUAL_AGENT_NAMES = [
   'orchestrator',
+  'planner',
   'oracle',
   'designer',
   'explorer',

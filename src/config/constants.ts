@@ -15,9 +15,15 @@ export const SUBAGENT_NAMES = [
   'council-master',
 ] as const;
 
+export const PRIMARY_AGENT_NAMES = ['orchestrator', 'planner'] as const;
+
 export const ORCHESTRATOR_NAME = 'orchestrator' as const;
 
-export const ALL_AGENT_NAMES = [ORCHESTRATOR_NAME, ...SUBAGENT_NAMES] as const;
+export const ALL_AGENT_NAMES = [
+  ORCHESTRATOR_NAME,
+  'planner',
+  ...SUBAGENT_NAMES,
+] as const;
 
 // Agent name type (for use in DEFAULT_MODELS)
 export type AgentName = (typeof ALL_AGENT_NAMES)[number];
@@ -37,6 +43,7 @@ export const ORCHESTRATABLE_AGENTS = [
   'designer',
   'fixer',
   'council',
+  'planner',
 ] as const;
 
 export const SUBAGENT_DELEGATION_RULES: Record<AgentName, readonly string[]> = {
@@ -49,12 +56,14 @@ export const SUBAGENT_DELEGATION_RULES: Record<AgentName, readonly string[]> = {
   council: [],
   councillor: [],
   'council-master': [],
+  planner: ['explorer', 'librarian', 'oracle'],
 };
 
 // Default models for each agent
 // orchestrator is undefined so its model is fully resolved at runtime via priority fallback
 export const DEFAULT_MODELS: Record<AgentName, string | undefined> = {
   orchestrator: undefined,
+  planner: 'openai/gpt-5.4',
   oracle: 'openai/gpt-5.4',
   librarian: 'openai/gpt-5.4-mini',
   explorer: 'openai/gpt-5.4-mini',

@@ -19,6 +19,7 @@ import { createFixerAgent } from './fixer';
 import { createLibrarianAgent } from './librarian';
 import { createOracleAgent } from './oracle';
 import { type AgentDefinition, createOrchestratorAgent } from './orchestrator';
+import { createPlannerAgent } from './planner';
 
 export type { AgentDefinition } from './orchestrator';
 
@@ -111,6 +112,7 @@ const SUBAGENT_FACTORIES: Record<SubagentName, AgentFactory> = {
   council: createCouncilAgent,
   councillor: createCouncillorAgent,
   'council-master': createCouncilMasterAgent,
+  planner: createPlannerAgent,
 };
 
 // Public API
@@ -222,7 +224,7 @@ export function getAgentConfigs(
         sdkConfig.hidden = true;
       } else if (isSubagent(a.name)) {
         sdkConfig.mode = 'subagent';
-      } else if (a.name === 'orchestrator') {
+      } else if (a.name === 'orchestrator' || a.name === 'planner') {
         sdkConfig.mode = 'primary';
       }
 
